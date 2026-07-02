@@ -72,6 +72,8 @@ All run data is stored under `runs/<run-id>/`.
 
 `python -m davy status <run-id>` reads `protocol.json` and reports the current relay status, whether `codex_output.md` and `next_chatgpt.md` exist, the latest `launch.json` result when present, missing relay files, and the next expected operator action. Use `--json` for the same operator-facing view as structured data.
 
+The status view also runs relay integrity checks. It reports missing or unreadable `protocol.json`, unknown status values, run-id mismatches, missing artifacts required by the current status, and failed runs without error metadata. Integrity failures are included in both human and JSON output.
+
 ## Protocol
 
 Every run has `runs/<run-id>/protocol.json`, a deterministic JSON summary for ChatGPT/Codex handoff state. It is synchronized whenever DAVY creates a run, records output, shows handoff artifacts, or changes captain status. Existing runs without `protocol.json` are backfilled when `python -m davy protocol <run-id>` is run.

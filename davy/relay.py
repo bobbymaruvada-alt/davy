@@ -214,7 +214,8 @@ def status(run_id, root=Path.cwd()):
 def relay_status_view(run_id, root=Path.cwd()):
     root = Path(root)
     run_id = validate_run_id(run_id)
-    protocol = load_protocol(run_id, root)
+    integrity = integrity_check(run_id, root)
+    protocol = integrity.get("protocol") or fallback_protocol_from_state(run_id, root)
     codex_output = artifact_presence(run_id, "codex_output.md", root)
     next_chatgpt_artifact = artifact_presence(run_id, "next_chatgpt.md", root)
     launch = latest_launch_result(run_id, root)
@@ -224,16 +225,148 @@ def relay_status_view(run_id, root=Path.cwd()):
             missing.append(artifact["path"])
     return {
         "run_id": run_id,
-        "current_status": protocol["current_status"],
-        "requires_captain": protocol["requires_captain"],
-        "captain_reason": protocol["captain_reason"],
+        "current_status": str(protocol.get("current_status") or "unknown"),
+        "requires_captain": bool(protocol.get("requires_captain")),
+        "captain_reason": str(protocol.get("captain_reason") or ""),
         "codex_output": codex_output,
         "next_chatgpt": next_chatgpt_artifact,
         "last_launch": launch,
         "missing": missing,
-        "next_expected_action": next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch),
+        "integrity": {
+            "ok": integrity["ok"],
+            "errors": integrity["errors"],
+            "warnings": integrity["warnings"],
+        },
+        "next_expected_action": next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch, integrity),
         "protocol_path": str(Path("runs") / run_id / "protocol.json"),
     }
+
+
+def integrity_check(run_id, root=Path.cwd()):
+    root = Path(root)
+    run_id = validate_run_id(run_id)
+    errors = []
+    warnings = []
+    state = read_state_payload(run_id, root, errors)
+    protocol = read_protocol_payload(run_id, root, errors)
+    launch = latest_launch_result(run_id, root)
+
+    state_status = str((state or {}).get("status") or "")
+    protocol_status = str((protocol or {}).get("current_status") or "")
+    effective_status = protocol_status or state_status
+
+    if state and state.get("run_id") != run_id:
+        add_integrity_error(errors, "state_run_id_mismatch", f"state.json run_id {state.get('run_id')!r} does not match requested run {run_id!r}.", run_id, "state.json")
+    if protocol:
+        if protocol.get("run_id") != run_id:
+            add_integrity_error(errors, "protocol_run_id_mismatch", f"protocol.json run_id {protocol.get('run_id')!r} does not match requested run {run_id!r}.", run_id, "protocol.json")
+        if state_status and protocol_status and state_status != protocol_status:
+            add_integrity_error(errors, "status_mismatch", f"state.json status {state_status!r} does not match protocol.json status {protocol_status!r}.", run_id, "protocol.json")
+
+    for status_value, artifact in ((state_status, "state.json"), (protocol_status, "protocol.json")):
+        if status_value and status_value not in VALID_STATUSES:
+            add_integrity_error(errors, "unknown_status", f"{artifact} has unknown status {status_value!r}.", run_id, artifact)
+
+    if effective_status == "ready_for_chatgpt":
+        require_artifact(errors, run_id, root, "next_chatgpt.md", "ready_for_chatgpt requires next_chatgpt.md.")
+        require_artifact(errors, run_id, root, "codex_output.md", "ready_for_chatgpt requires codex_output.md.")
+    if effective_status == "ready_for_codex":
+        require_artifact(errors, run_id, root, "chatgpt_prompt.md", "ready_for_codex requires chatgpt_prompt.md.")
+        require_artifact(errors, run_id, root, "codex_prompt.md", "ready_for_codex requires codex_prompt.md.")
+    if effective_status == "failed" and not failed_error_metadata_exists(run_id, root, launch):
+        add_integrity_error(errors, "failed_missing_error_metadata", "failed status requires launch error metadata or a failure reason event.", run_id, "launch.json")
+    if effective_status == "complete":
+        require_artifact(errors, run_id, root, "codex_output.md", "complete status requires codex_output.md.")
+
+    return {
+        "ok": not errors,
+        "errors": errors,
+        "warnings": warnings,
+        "state": state,
+        "protocol": protocol,
+    }
+
+
+def read_state_payload(run_id, root, errors):
+    path = run_path(run_id, root) / "state.json"
+    if not path.exists():
+        add_integrity_error(errors, "missing_state", "state.json is missing.", run_id, "state.json")
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        add_integrity_error(errors, "unreadable_state", f"state.json is not readable JSON: {error}", run_id, "state.json")
+        return None
+    if not isinstance(payload, dict):
+        add_integrity_error(errors, "invalid_state", "state.json must contain an object.", run_id, "state.json")
+        return None
+    for field_name in ("run_id", "status", "created_at", "updated_at", "transcript"):
+        if field_name not in payload:
+            add_integrity_error(errors, "state_missing_field", f"state.json missing field: {field_name}", run_id, "state.json")
+    return payload
+
+
+def read_protocol_payload(run_id, root, errors):
+    path = run_path(run_id, root) / "protocol.json"
+    if not path.exists():
+        add_integrity_error(errors, "missing_protocol", "protocol.json is missing.", run_id, "protocol.json")
+        return None
+    try:
+        payload = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        add_integrity_error(errors, "unreadable_protocol", f"protocol.json is not readable JSON: {error}", run_id, "protocol.json")
+        return None
+    if not isinstance(payload, dict):
+        add_integrity_error(errors, "invalid_protocol", "protocol.json must contain an object.", run_id, "protocol.json")
+        return None
+    try:
+        validate_protocol(payload)
+    except DavyError as error:
+        add_integrity_error(errors, "invalid_protocol", str(error), run_id, "protocol.json")
+    return payload
+
+
+def fallback_protocol_from_state(run_id, root):
+    try:
+        run = load_run(run_id, root)
+    except DavyError:
+        return {
+            "run_id": validate_run_id(run_id),
+            "current_status": "unknown",
+            "requires_captain": False,
+            "captain_reason": "",
+        }
+    return {
+        "run_id": run.run_id,
+        "current_status": run.status,
+        "requires_captain": run.status == "needs_captain",
+        "captain_reason": "",
+    }
+
+
+def add_integrity_error(errors, code, message, run_id, artifact):
+    errors.append({
+        "code": code,
+        "message": message,
+        "path": str(Path("runs") / validate_run_id(run_id) / artifact),
+    })
+
+
+def require_artifact(errors, run_id, root, artifact, message):
+    if not (run_path(run_id, root) / artifact).exists():
+        add_integrity_error(errors, f"missing_{artifact.replace('.', '_')}", message, run_id, artifact)
+
+
+def failed_error_metadata_exists(run_id, root, launch):
+    if launch.get("exists") and (launch.get("error") or launch.get("stderr") or launch.get("exit_code") not in {None, 0}):
+        return True
+    for event in reversed(read_events(run_id, root)):
+        if event.get("event") != "status_marked_failed":
+            continue
+        payload = event.get("payload") or {}
+        if payload.get("reason") or payload.get("message"):
+            return True
+    return False
 
 
 def artifact_presence(run_id, artifact, root=Path.cwd()):
@@ -280,7 +413,9 @@ def latest_launch_result(run_id, root=Path.cwd()):
     return payload
 
 
-def next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch):
+def next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch, integrity=None):
+    if integrity and integrity.get("errors"):
+        return "Resolve relay integrity errors before advancing this run."
     status_value = protocol["current_status"]
     if protocol.get("requires_captain"):
         reason = protocol.get("captain_reason") or "Captain approval is required."
@@ -328,6 +463,15 @@ def format_relay_status_view(view):
             lines.append(f"- error: {launch['error']}")
         elif launch.get("stderr"):
             lines.append(f"- stderr: {launch['stderr']}")
+    integrity = view.get("integrity") or {"ok": True, "errors": [], "warnings": []}
+    lines.append("Integrity:")
+    if integrity.get("ok"):
+        lines.append("- ok")
+    else:
+        for error in integrity.get("errors") or []:
+            lines.append(f"- error {error.get('code', 'unknown')}: {error.get('message', '')} ({error.get('path', '')})")
+        for warning in integrity.get("warnings") or []:
+            lines.append(f"- warning {warning.get('code', 'unknown')}: {warning.get('message', '')} ({warning.get('path', '')})")
     lines.append(f"Next action: {view['next_expected_action']}")
     lines.append("Missing files:")
     if view["missing"]:

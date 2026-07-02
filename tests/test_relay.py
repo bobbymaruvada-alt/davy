@@ -716,6 +716,117 @@ DAVY-006 Improve local handoff ergonomics
             self.assertIn("last_launch", payload)
             self.assertIn("next_expected_action", payload)
 
+
+    def test_integrity_check_valid_relay_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            output = root / "codex.md"
+            prompt.write_text("Valid integrity")
+            output.write_text("Valid output")
+            create_run(prompt, root=root, run_id="davy-integrity-valid")
+            record_codex_output("davy-integrity-valid", output, root=root)
+
+            view = status("davy-integrity-valid", root=root)
+
+            self.assertTrue(view["integrity"]["ok"])
+            self.assertEqual(view["integrity"]["errors"], [])
+
+    def test_integrity_check_reports_missing_protocol(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Missing protocol")
+            create_run(prompt, root=root, run_id="davy-integrity-missing-protocol")
+            (root / "runs" / "davy-integrity-missing-protocol" / "protocol.json").unlink()
+
+            view = status("davy-integrity-missing-protocol", root=root)
+
+            self.assertFalse(view["integrity"]["ok"])
+            self.assertIn("missing_protocol", integrity_codes(view))
+            self.assertIn("Resolve relay integrity errors", view["next_expected_action"])
+
+    def test_integrity_check_reports_unknown_status(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Unknown status")
+            create_run(prompt, root=root, run_id="davy-integrity-unknown-status")
+            state_path = root / "runs" / "davy-integrity-unknown-status" / "state.json"
+            protocol_path = root / "runs" / "davy-integrity-unknown-status" / "protocol.json"
+            state_payload = json.loads(state_path.read_text())
+            protocol_payload = json.loads(protocol_path.read_text())
+            state_payload["status"] = "mystery"
+            protocol_payload["current_status"] = "mystery"
+            state_path.write_text(json.dumps(state_payload))
+            protocol_path.write_text(json.dumps(protocol_payload))
+
+            view = status("davy-integrity-unknown-status", root=root)
+
+            self.assertFalse(view["integrity"]["ok"])
+            self.assertIn("unknown_status", integrity_codes(view))
+            self.assertEqual(view["current_status"], "mystery")
+
+    def test_integrity_check_reports_ready_for_chatgpt_without_next_chatgpt(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            output = root / "codex.md"
+            prompt.write_text("Ready missing review")
+            output.write_text("Output")
+            create_run(prompt, root=root, run_id="davy-integrity-missing-review")
+            record_codex_output("davy-integrity-missing-review", output, root=root)
+            (root / "runs" / "davy-integrity-missing-review" / "next_chatgpt.md").unlink()
+
+            view = status("davy-integrity-missing-review", root=root)
+
+            self.assertFalse(view["integrity"]["ok"])
+            self.assertIn("missing_next_chatgpt_md", integrity_codes(view))
+
+    def test_integrity_check_reports_failed_without_error_metadata(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Failed missing metadata")
+            create_run(prompt, root=root, run_id="davy-integrity-failed")
+            state_path = root / "runs" / "davy-integrity-failed" / "state.json"
+            protocol_path = root / "runs" / "davy-integrity-failed" / "protocol.json"
+            state_payload = json.loads(state_path.read_text())
+            protocol_payload = json.loads(protocol_path.read_text())
+            state_payload["status"] = "failed"
+            protocol_payload["current_status"] = "failed"
+            state_path.write_text(json.dumps(state_payload))
+            protocol_path.write_text(json.dumps(protocol_payload))
+
+            view = status("davy-integrity-failed", root=root)
+
+            self.assertFalse(view["integrity"]["ok"])
+            self.assertIn("failed_missing_error_metadata", integrity_codes(view))
+
+    def test_status_output_includes_integrity_errors(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Human integrity")
+            create_run(prompt, root=root, run_id="davy-integrity-human")
+            (root / "runs" / "davy-integrity-human" / "protocol.json").unlink()
+            cwd = Path.cwd()
+            try:
+                import contextlib
+                import io
+                import os
+                os.chdir(root)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    main(["status", "davy-integrity-human"])
+            finally:
+                os.chdir(cwd)
+
+            output = stdout.getvalue()
+            self.assertIn("Integrity:", output)
+            self.assertIn("missing_protocol", output)
+            self.assertIn("Resolve relay integrity errors", output)
+
     def test_invalid_run_id_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -791,6 +902,9 @@ def assert_protocol_shape(testcase, payload):
         testcase.assertIn(field_name, payload["timestamps"])
 
 
+def integrity_codes(view):
+    return [error["code"] for error in view["integrity"]["errors"]]
+
 def event_records(root, run_id):
     return [json.loads(line) for line in (Path(root) / "runs" / run_id / "events.jsonl").read_text().splitlines()]
 
@@ -801,3 +915,4 @@ def fixed_time():
 
 if __name__ == "__main__":
     unittest.main()
+

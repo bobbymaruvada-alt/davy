@@ -16,6 +16,7 @@ from davy.relay import (
     protocol_view,
     status,
     transcript_view,
+    format_relay_status_view,
     format_transcript_view,
 )
 
@@ -120,8 +121,8 @@ def main(argv=None):
                 print(format_launch(metadata))
             return
         if args.command == "status":
-            run = status(args.run_id, root=root)
-            print(json.dumps(run.to_dict(), indent=2) if args.json else format_run(run))
+            view = status(args.run_id, root=root)
+            print(json.dumps(view, indent=2) if args.json else format_relay_status_view(view))
             return
         if args.command == "transcript":
             view = transcript_view(args.run_id, root=root)

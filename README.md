@@ -47,6 +47,7 @@ Inspect status and transcript:
 
 ```bash
 python -m davy status <run-id>
+python -m davy status <run-id> --json
 python -m davy list
 python -m davy transcript <run-id>
 python -m davy transcript <run-id> --json
@@ -65,6 +66,11 @@ python -m davy fail <run-id> --reason "Blocked by failing validation"
 ```
 
 All run data is stored under `runs/<run-id>/`.
+
+
+## Relay Status
+
+`python -m davy status <run-id>` reads `protocol.json` and reports the current relay status, whether `codex_output.md` and `next_chatgpt.md` exist, the latest `launch.json` result when present, missing relay files, and the next expected operator action. Use `--json` for the same operator-facing view as structured data.
 
 ## Protocol
 

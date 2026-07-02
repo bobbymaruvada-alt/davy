@@ -17,6 +17,7 @@ from davy.relay import (
     next_codex_prompt,
     record_codex_output,
     protocol_view,
+    status,
     transcript_view,
 )
 
@@ -634,6 +635,86 @@ DAVY-006 Improve local handoff ergonomics
             self.assertIn("Second output", (root / "runs" / "davy-manual-record" / "codex_output.md").read_text())
             self.assertEqual(protocol_view("davy-manual-record", root=root)["completed_work"], ["Second output"])
             self.assertEqual(load_run("davy-manual-record", root=root).status, "ready_for_chatgpt")
+
+
+    def test_status_reports_ready_run_with_missing_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("Status ready")
+            create_run(prompt, root=root, run_id="davy-status-ready")
+
+            view = status("davy-status-ready", root=root)
+
+            self.assertEqual(view["current_status"], "ready_for_codex")
+            self.assertFalse(view["codex_output"]["exists"])
+            self.assertFalse(view["next_chatgpt"]["exists"])
+            self.assertEqual(view["last_launch"]["exists"], False)
+            self.assertIn("runs/davy-status-ready/codex_output.md", view["missing"])
+            self.assertIn("runs/davy-status-ready/next_chatgpt.md", view["missing"])
+            self.assertIn("record-codex", view["next_expected_action"])
+
+    def test_status_reports_ready_for_chatgpt_outputs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            output = root / "codex.md"
+            prompt.write_text("Status output")
+            output.write_text("Codex status output")
+            create_run(prompt, root=root, run_id="davy-status-output")
+            record_codex_output("davy-status-output", output, root=root)
+
+            view = status("davy-status-output", root=root)
+
+            self.assertEqual(view["current_status"], "ready_for_chatgpt")
+            self.assertTrue(view["codex_output"]["exists"])
+            self.assertTrue(view["next_chatgpt"]["exists"])
+            self.assertEqual(view["missing"], [])
+            self.assertIn("ChatGPT", view["next_expected_action"])
+
+    def test_status_reports_failed_launch_result_without_missing_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prepare_next_codex_run(root, "davy-status-failed")
+
+            def runner(command, prompt_text):
+                return FakeProcessResult(returncode=2, stdout="new output", stderr="boom")
+
+            launch_codex("davy-status-failed", root=root, execute=True, runner=runner)
+
+            view = status("davy-status-failed", root=root)
+
+            self.assertEqual(view["current_status"], "failed")
+            self.assertTrue(view["codex_output"]["exists"])
+            self.assertTrue(view["next_chatgpt"]["exists"])
+            self.assertTrue(view["last_launch"]["exists"])
+            self.assertEqual(view["last_launch"]["exit_code"], 2)
+            self.assertEqual(view["last_launch"]["intake_status"], "skipped_failed_launch")
+            self.assertIn("failed Codex launch", view["next_expected_action"])
+
+    def test_cli_status_json_outputs_operator_view(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            prompt = root / "prompt.md"
+            prompt.write_text("CLI status view")
+            create_run(prompt, root=root, run_id="davy-cli-status-view")
+            cwd = Path.cwd()
+            try:
+                import contextlib
+                import io
+                import os
+                os.chdir(root)
+                stdout = io.StringIO()
+                with contextlib.redirect_stdout(stdout):
+                    main(["status", "davy-cli-status-view", "--json"])
+            finally:
+                os.chdir(cwd)
+
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["run_id"], "davy-cli-status-view")
+            self.assertEqual(payload["current_status"], "ready_for_codex")
+            self.assertIn("last_launch", payload)
+            self.assertIn("next_expected_action", payload)
 
     def test_invalid_run_id_rejects_path_traversal(self):
         with tempfile.TemporaryDirectory() as tmp:

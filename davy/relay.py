@@ -208,7 +208,138 @@ def next_chatgpt(run_id, root=Path.cwd(), now=None):
 
 
 def status(run_id, root=Path.cwd()):
-    return load_run(run_id, root)
+    return relay_status_view(run_id, root)
+
+
+def relay_status_view(run_id, root=Path.cwd()):
+    root = Path(root)
+    run_id = validate_run_id(run_id)
+    protocol = load_protocol(run_id, root)
+    codex_output = artifact_presence(run_id, "codex_output.md", root)
+    next_chatgpt_artifact = artifact_presence(run_id, "next_chatgpt.md", root)
+    launch = latest_launch_result(run_id, root)
+    missing = []
+    for artifact in (codex_output, next_chatgpt_artifact):
+        if not artifact["exists"]:
+            missing.append(artifact["path"])
+    return {
+        "run_id": run_id,
+        "current_status": protocol["current_status"],
+        "requires_captain": protocol["requires_captain"],
+        "captain_reason": protocol["captain_reason"],
+        "codex_output": codex_output,
+        "next_chatgpt": next_chatgpt_artifact,
+        "last_launch": launch,
+        "missing": missing,
+        "next_expected_action": next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch),
+        "protocol_path": str(Path("runs") / run_id / "protocol.json"),
+    }
+
+
+def artifact_presence(run_id, artifact, root=Path.cwd()):
+    path = run_path(run_id, root) / artifact
+    return {
+        "path": str(Path("runs") / validate_run_id(run_id) / artifact),
+        "exists": path.exists(),
+    }
+
+
+def latest_launch_result(run_id, root=Path.cwd()):
+    path = run_path(run_id, root) / "launch.json"
+    payload = {
+        "path": str(Path("runs") / validate_run_id(run_id) / "launch.json"),
+        "exists": False,
+        "execution_mode": "",
+        "exit_code": None,
+        "intake_status": "",
+        "launch_time": "",
+        "finish_time": "",
+        "command_text": "",
+        "error": "",
+        "stderr": "",
+    }
+    if not path.exists():
+        return payload
+    try:
+        stored = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise DavyError(f"Could not read launch metadata: {path}") from error
+    if not isinstance(stored, dict):
+        raise DavyError(f"Launch metadata must be an object: {path}")
+    payload.update({
+        "exists": True,
+        "execution_mode": str(stored.get("execution_mode") or ""),
+        "exit_code": stored.get("exit_code"),
+        "intake_status": str(stored.get("intake_status") or ""),
+        "launch_time": str(stored.get("launch_time") or ""),
+        "finish_time": str(stored.get("finish_time") or ""),
+        "command_text": str(stored.get("command_text") or ""),
+        "error": str(stored.get("error") or ""),
+        "stderr": str(stored.get("stderr") or ""),
+    })
+    return payload
+
+
+def next_expected_action(protocol, codex_output, next_chatgpt_artifact, launch):
+    status_value = protocol["current_status"]
+    if protocol.get("requires_captain"):
+        reason = protocol.get("captain_reason") or "Captain approval is required."
+        return f"Captain approval required: {reason}"
+    if status_value == "complete":
+        return "No action; run is complete."
+    if status_value == "failed":
+        if launch.get("exists") and launch.get("exit_code") not in {None, 0}:
+            return "Review the failed Codex launch, then rerun safely or mark needs_captain."
+        return "Review the failed run, then rerun safely or mark needs_captain."
+    if not codex_output["exists"]:
+        return "Run launch-codex --execute or record-codex with a Codex output file."
+    if not next_chatgpt_artifact["exists"]:
+        return "Run next-chatgpt to prepare the ChatGPT review artifact."
+    if status_value == "ready_for_chatgpt":
+        return "Send next_chatgpt.md to ChatGPT for review."
+    if status_value == "waiting_for_chatgpt":
+        return "Wait for ChatGPT review, then create the next Codex prompt when ready."
+    if status_value in {"ready_for_codex", "waiting_for_codex"}:
+        return "Run next-codex, then launch-codex when the generated prompt is ready."
+    return "Inspect transcript and protocol to determine the next safe action."
+
+
+def format_relay_status_view(view):
+    launch = view["last_launch"]
+    lines = [
+        "DAVY Relay Status",
+        f"Run: {view['run_id']}",
+        f"Status: {view['current_status']}",
+        f"Protocol: {view['protocol_path']}",
+        f"Codex output: {presence_label(view['codex_output'])}",
+        f"Next ChatGPT: {presence_label(view['next_chatgpt'])}",
+        "Last Codex launch:",
+    ]
+    if not launch["exists"]:
+        lines.append(f"- none ({launch['path']})")
+    else:
+        lines.extend([
+            f"- mode: {launch['execution_mode'] or 'unknown'}",
+            f"- exit code: {launch['exit_code']}",
+            f"- intake: {launch['intake_status'] or 'unknown'}",
+            f"- finished: {launch['finish_time'] or '(not finished)'}",
+        ])
+        if launch.get("error"):
+            lines.append(f"- error: {launch['error']}")
+        elif launch.get("stderr"):
+            lines.append(f"- stderr: {launch['stderr']}")
+    lines.append(f"Next action: {view['next_expected_action']}")
+    lines.append("Missing files:")
+    if view["missing"]:
+        lines.extend(f"- {artifact}" for artifact in view["missing"])
+    else:
+        lines.append("- none")
+    return "\n".join(lines)
+
+
+def presence_label(artifact):
+    state = "present" if artifact["exists"] else "missing"
+    return f"{state} ({artifact['path']})"
 
 
 def next_codex_prompt(run_id, root=Path.cwd()):
